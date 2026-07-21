@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+    <link rel="stylesheet" href="/static/style.css">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>fetch — local video downloader</title>
+</head>
+
+<body>
+    <div class="wrap">
+
+        <div class="brand"><span class="dot"></span>
+            <h1>fetch</h1>
+        </div>
+        <p class="sub">paste a video or playlist url — resolutions shown are only the ones that actually exist</p>
+
+        <div class="panel">
+            <label>source url</label>
+            <div class="url-row">
+                <input type="text" id="url-input" placeholder="https://www.youtube.com/watch?v=..." autofocus>
+                <button id="probe-btn">check</button>
+            </div>
+
+            <div id="ffmpeg-warn">⚠ ffmpeg not found on PATH — high-res merges will fail. Install it and restart this
+                app.</div>
+
+            <div id="probe-info">
+                <div class="title-line"><span class="tag" id="playlist-tag" style="display:none;">playlist</span><span
+                        id="video-title"></span></div>
+                <label>resolution</label>
+                <div class="res-grid" id="res-grid"></div>
+                <div class="playlist-toggle" id="playlist-toggle-row" style="display:none;">
+                    <input type="checkbox" id="playlist-check">
+                    <label for="playlist-check"
+                        style="margin:0; text-transform:none; letter-spacing:normal; color:var(--dim);">download entire
+                        playlist (unchecked = just this video)</label>
+                </div>
+                <button class="primary" id="download-btn" style="width:100%;">download</button>
+            </div>
+        </div>
+
+        <div class="panel" id="progress-panel">
+            <div class="job-title" id="job-title">—</div>
+            <div class="bar-track">
+                <div class="bar-fill" id="bar-fill"></div>
+            </div>
+            <div class="stat-row"><span>progress</span><span class="val" id="stat-percent">0%</span></div>
+            <div class="stat-row"><span>speed</span><span class="val" id="stat-speed">—</span></div>
+            <div class="status-text" id="status-text">—</div>
+            <div class="file-list" id="file-list"></div>
+        </div>
+
+        <p class="footer-note">files saved to ./downloads next to app.py</p>
+    </div>
+
+    <script>
+        let selectedHeight = undefined; // undefined = not yet chosen, null = "best available"
+        let pollTimer = null;
+
+        const urlInput = document.getElementById('url-input');
+        const probeBtn = document.getElementById('probe-btn');
+        const probeInfo = document.getElementById('probe-info');
+        const resGrid = document.getElementById('res-grid');
+        const videoTitle = document.getElementById('video-title');
+        const playlistTag = document.getElementById('playlist-tag');
+        const playlistRow = document.getElementById('playlist-toggle-row');
+        const playlistCheck = document.getElementById('playlist-check');
+        const downloadBtn = document.getElementById('download-btn');
+        const ffmpegWarn = document.getElementById('ffmpeg-warn');
+
+        const progressPanel = document.getElementById('progress-panel');
+        const jobTitleEl = document.getElementById('job-title');
+        const barFill = document.getElementById('bar-fill');
+        const statPercent = document.getElementById('stat-percent');
+        const statSpeed = document.getElementById('stat-speed');
+        const statusText = document.getElementById('status-text');
+        const fileList = document.getElementById('file-list');
+
+        probeBtn.addEventListener('click', probe);
+        urlInput.addEventListener('keydown', e => { if (e.key === 'Enter') probe(); });
+
+        async function probe() {
+            const url = urlInput.value.trim();
+            if (!url) return;
+
+            probeBtn.disabled = true;
+            probeBtn.textContent = 'checking...';
+            probeInfo.style.display = 'none';
+
+            try {
+                const res = await fetch('/api/probe', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url })
+                });
+                const data = await res.json();
+                if (data.error) { alert('Error: ' + data.error); return; }
+
+                videoTitle.textContent = data.title;
+                playlistTag.style.display = data.is_playlist ? 'inline-block' : 'none';
+                playlistRow.style.display = data.is_playlist ? 'flex' : 'none';
+                ffmpegWarn.style.display = data.ffmpeg_found ? 'none' : 'block';
+
+                resGrid.innerHTML = '';
+                selectedHeight = undefined;
+                data.resolutions.forEach((r, i) => {
+                    const chip = document.createElement('div');
+                    chip.className = 'res-chip';
+                    chip.textContent = r.label;
+                    chip.addEventListener('click', () => {
+                        document.querySelectorAll('.res-chip').forEach(c => c.classList.remove('selected'));
+                        chip.classList.add('selected');
+                        selectedHeight = r.height;
+                    });
+                    resGrid.appendChild(chip);
+                    if (i === data.resolutions.length - 1) { chip.click(); } // default to "best available"
+                });
+
+                probeInfo.style.display = 'block';
+            } catch (e) {
+                alert('Could not reach the local server: ' + e);
+            } finally {
+                probeBtn.disabled = false;
+                probeBtn.textContent = 'check';
+            }
+        }
+
+        downloadBtn.addEventListener('click', startDownload);
+
+        async function startDownload() {
+            const url = urlInput.value.trim();
+            if (!url) return;
+
+            downloadBtn.disabled = true;
+            progressPanel.style.display = 'block';
+            jobTitleEl.textContent = videoTitle.textContent;
+            barFill.style.width = '0%';
+            statPercent.textContent = '0%';
+            statSpeed.textContent = '—';
+            statusText.textContent = 'Starting...';
+            statusText.classList.remove('error');
+            fileList.innerHTML = '';
+
+            const res = await fetch('/api/download', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    url,
+                    height: selectedHeight,
+                    download_playlist: playlistCheck.checked
+                })
+            });
+            const data = await res.json();
+            if (data.error) { alert('Error: ' + data.error); downloadBtn.disabled = false; return; }
+
+            pollStatus(data.job_id);
+        }
+
+        function pollStatus(jobId) {
+            if (pollTimer) clearInterval(pollTimer);
+            pollTimer = setInterval(async () => {
+                const res = await fetch('/api/status/' + jobId);
+                const job = await res.json();
+
+                const pct = parseInt(job.percent) || 0;
+                barFill.style.width = pct + '%';
+                statPercent.textContent = job.percent || '0%';
+                statSpeed.textContent = job.speed || '—';
+                statusText.textContent = job.status_text || job.status;
+                if (job.title) jobTitleEl.textContent = job.title;
+
+                fileList.innerHTML = '';
+                (job.files || []).forEach(f => {
+                    const row = document.createElement('div');
+                    row.className = 'file-item';
+                    row.innerHTML = `<span class="name">${f.name}</span><span class="res">${f.resolution}</span>`;
+                    fileList.appendChild(row);
+                });
+
+                if (job.status === 'done') {
+                    statusText.textContent = 'Complete';
+                    clearInterval(pollTimer);
+                    downloadBtn.disabled = false;
+                } else if (job.status === 'error') {
+                    statusText.textContent = 'Error: ' + job.error;
+                    statusText.classList.add('error');
+                    clearInterval(pollTimer);
+                    downloadBtn.disabled = false;
+                }
+            }, 1000);
+        }
+    </script>
+</body>
+</html>
